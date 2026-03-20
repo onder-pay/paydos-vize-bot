@@ -3,7 +3,15 @@
   "version": "1.0.0",
   "description": "Paydos Turizm - Schengen Vize Randevu Takip Botu (VFS Global)",
   "private": true,
+  "type": "module",
   "engines": {
     "node": ">=18"
   }
 }
+```
+
+`"type": "module"` satırını ekliyoruz. Commit et.
+
+**2.** Sonra tarayıcıda tekrar aç:
+```
+https://paydos-vize-bot.vercel.app/api/check
