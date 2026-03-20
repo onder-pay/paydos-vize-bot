@@ -1,0 +1,9 @@
+{
+  "name": "paydos-vize-bot",
+  "version": "1.0.0",
+  "description": "Paydos Turizm - Schengen Vize Randevu Takip Botu (VFS Global)",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  }
+}
