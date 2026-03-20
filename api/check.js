@@ -1,10 +1,11 @@
 // Paydos Turizm - Schengen Vize Randevu Takip Botu
-// Vercel Cron ile her 5 dakikada çalışır
-// VFS Global randevularını kontrol eder → Telegram'a bildirim gönderir
+// İki farklı API kaynağı dener (fallback)
 
-const VISA_API_URL = "https://api.visasbot.com/api/visa/list";
+const APIS = [
+  "https://api.schengenvisaappointments.com/api/visa-list/?format=json",
+  "https://api.visasbot.com/api/visa/list",
+];
 
-// Takip edilecek ülkeler (mission_code)
 const TARGET_MISSIONS = ["fra", "bel", "pol", "esp"];
 
 const MISSION_LABELS = {
@@ -14,15 +15,11 @@ const MISSION_LABELS = {
   esp: "🇪🇸 İspanya",
 };
 
-// Upstash Redis - bildirim tekrarını önlemek için
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-
-// Telegram
 const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// ─── Redis Helpers ───────────────────────────────────────────────
 async function redisGet(key) {
   if (!UPSTASH_URL) return null;
   try {
@@ -43,12 +40,9 @@ async function redisSet(key, value, exSeconds = 86400) {
       `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}/ex/${exSeconds}`,
       { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } }
     );
-  } catch {
-    // sessizce devam et
-  }
+  } catch {}
 }
 
-// ─── Telegram Helper ─────────────────────────────────────────────
 async function sendTelegram(text) {
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
   const res = await fetch(url, {
@@ -64,32 +58,46 @@ async function sendTelegram(text) {
   return res.ok;
 }
 
-// ─── Randevu Kontrol ─────────────────────────────────────────────
 async function fetchAppointments() {
-  const res = await fetch(VISA_API_URL, {
-    headers: {
-      "User-Agent": "PapdosTurizm-VizeBot/1.0",
-      Accept: "application/json",
-    },
-  });
+  let lastError = null;
 
-  if (!res.ok) {
-    throw new Error(`API yanıt vermedi: ${res.status}`);
+  for (const apiUrl of APIS) {
+    try {
+      const res = await fetch(apiUrl, {
+        headers: {
+          "User-Agent": "PaydosTurizm-VizeBot/1.0",
+          Accept: "application/json",
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (!res.ok) {
+        lastError = `${apiUrl} => ${res.status}`;
+        continue;
+      }
+
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : data.data || data.results || data.appointments || [];
+
+      if (list.length > 0) {
+        return { list, source: apiUrl };
+      }
+
+      lastError = `${apiUrl} => bos liste`;
+    } catch (err) {
+      lastError = `${apiUrl} => ${err.message}`;
+      continue;
+    }
   }
 
-  const data = await res.json();
-
-  // Array değilse sarmalıyorum
-  const list = Array.isArray(data) ? data : data.data || data.appointments || [];
-
-  return list;
+  throw new Error(`Tum API'ler basarisiz: ${lastError}`);
 }
 
 function filterAppointments(appointments) {
   return appointments.filter((apt) => {
     const country = (apt.country_code || "").toLowerCase();
     const mission = (apt.mission_code || "").toLowerCase();
-    const status = (apt.status || "").toLowerCase();
+    const status = (apt.status || apt.appointment_status || "").toLowerCase();
 
     return (
       country === "tur" &&
@@ -100,10 +108,9 @@ function filterAppointments(appointments) {
 }
 
 function buildCacheKey(apt) {
-  // Her randevu için benzersiz anahtar
   const mission = (apt.mission_code || "").toLowerCase();
-  const center = (apt.center || "").replace(/\s+/g, "_");
-  const visaType = (apt.visa_type || apt.subcategory || "").replace(/\s+/g, "_");
+  const center = (apt.center || apt.center_name || "").replace(/\s+/g, "_").substring(0, 50);
+  const visaType = (apt.visa_type || apt.subcategory || "").replace(/\s+/g, "_").substring(0, 30);
   const date = apt.appointment_date || apt.book_now_date || "nodate";
   return `paydos:${mission}:${center}:${visaType}:${date}`;
 }
@@ -111,9 +118,9 @@ function buildCacheKey(apt) {
 function formatMessage(apt) {
   const mission = (apt.mission_code || "").toLowerCase();
   const label = MISSION_LABELS[mission] || mission.toUpperCase();
-  const status = (apt.status || "").toLowerCase();
+  const status = (apt.status || apt.appointment_status || "").toLowerCase();
   const statusEmoji = status === "open" ? "✅" : "⏳";
-  const center = apt.center || "Bilinmiyor";
+  const center = apt.center || apt.center_name || "Bilinmiyor";
   const visaType = apt.visa_type || apt.subcategory || "Genel";
   const date = apt.appointment_date || apt.book_now_date || "Tarih yok";
 
@@ -131,31 +138,21 @@ function formatMessage(apt) {
   ].join("\n");
 }
 
-// ─── Ana Handler ─────────────────────────────────────────────────
 export default async function handler(req, res) {
-  // Vercel Cron güvenlik kontrolü (opsiyonel)
-  // const authHeader = req.headers["authorization"];
-  // if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-  //   return res.status(401).json({ error: "Yetkisiz" });
-  // }
-
   try {
-    // 1. Randevuları çek
-    const allAppointments = await fetchAppointments();
-
-    // 2. Filtrele: Türkiye → Hedef ülkeler, sadece açık olanlar
-    const openSlots = filterAppointments(allAppointments);
+    const { list, source } = await fetchAppointments();
+    const openSlots = filterAppointments(list);
 
     if (openSlots.length === 0) {
       return res.status(200).json({
         ok: true,
         message: "Açık randevu yok",
-        checked: allAppointments.length,
+        checked: list.length,
+        source,
         time: new Date().toISOString(),
       });
     }
 
-    // 3. Her açık randevu için bildirim gönder (tekrar olmayanlar)
     let sent = 0;
     let skipped = 0;
 
@@ -168,17 +165,14 @@ export default async function handler(req, res) {
         continue;
       }
 
-      // Telegram'a gönder
       const msg = formatMessage(apt);
       const ok = await sendTelegram(msg);
 
       if (ok) {
-        // 6 saat boyunca tekrar gönderme (21600 saniye)
         await redisSet(cacheKey, "1", 21600);
         sent++;
       }
 
-      // Telegram rate limit - mesajlar arası 1 saniye bekle
       if (sent > 0) {
         await new Promise((r) => setTimeout(r, 1000));
       }
@@ -186,21 +180,23 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      total: allAppointments.length,
+      total: list.length,
       open: openSlots.length,
       sent,
       skipped,
+      source,
       time: new Date().toISOString(),
     });
   } catch (error) {
     console.error("Hata:", error.message);
 
-    // Kritik hata durumunda Telegram'a hata bildirimi (günde max 1)
     const errorCacheKey = "paydos:error:daily";
     const errorSent = await redisGet(errorCacheKey);
     if (!errorSent && TG_BOT_TOKEN) {
-      await sendTelegram(`⚠️ *Vize Bot Hatası*\n\n\`${error.message}\`\n\n_Otomatik kontrol geçici olarak başarısız._`);
-      await redisSet(errorCacheKey, "1", 3600); // 1 saat tekrarlama
+      await sendTelegram(
+        `⚠️ *Vize Bot Hatası*\n\n\`${error.message}\`\n\n_Otomatik kontrol geçici olarak başarısız._`
+      );
+      await redisSet(errorCacheKey, "1", 3600);
     }
 
     return res.status(200).json({
